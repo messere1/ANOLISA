@@ -13,7 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anolisa_platform::ipc::{PeerCredential, get_peer_credential, recv_message, send_message};
 
@@ -104,21 +104,30 @@ impl DaemonServer {
         fs::set_permissions(&self.socket_path, fs::Permissions::from_mode(0o660))?;
         Self::chgrp_anolisa(std::path::Path::new(&self.socket_path))?;
 
-        // Set a non-blocking accept timeout so we can check the shutdown flag.
-        listener.set_nonblocking(false)?;
+        // Poll accept() in non-blocking mode so the shutdown flag is
+        // observed even while no client connects: a blocking accept(2)
+        // parks the loop until one more connection arrives, so a
+        // Shutdown request (or request_shutdown) could never stop the
+        // daemon on its own — it only replied "shutdown initiated".
+        listener.set_nonblocking(true)?;
 
         eprintln!(
             "[anolisa-helper] listening on {} (v{})",
             self.socket_path, self.version
         );
 
-        for stream in listener.incoming() {
+        loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
             }
 
-            match stream {
-                Ok(stream) => {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    // The accepted stream does not inherit the listener's
+                    // non-blocking mode on Linux, but reset it explicitly
+                    // so the per-connection handler can use blocking IO on
+                    // every platform.
+                    let _ = stream.set_nonblocking(false);
                     let rate_limiter = Arc::clone(&self.rate_limiter);
                     let last_operation = Arc::clone(&self.last_operation);
                     let shutdown = Arc::clone(&self.shutdown);
@@ -137,6 +146,9 @@ impl DaemonServer {
                             eprintln!("[anolisa-helper] connection error: {e}");
                         }
                     });
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => {
                     eprintln!("[anolisa-helper] accept error: {e}");
@@ -208,7 +220,6 @@ fn handle_connection(
             &peer,
             rate_limiter,
             last_operation,
-            shutdown,
             version,
             start_time,
         );
@@ -226,8 +237,18 @@ fn handle_connection(
 
         send_message(&mut stream, &resp)?;
 
-        // Handle shutdown request.
+        // Handle shutdown request: publish the flag only now, after the
+        // reply is on the wire. The accept loop polls the flag every
+        // 50 ms and `run()` removes the socket once it observes it, so
+        // publishing from dispatch() let the daemon exit between
+        // constructing the Success and writing it — the client then
+        // read EOF instead of the reply it was owed. A denied Shutdown
+        // never reaches the arm below (the white-list check denies it
+        // first), so only an authorized Shutdown publishes here.
         if matches!(req, HelperRequest::Shutdown) {
+            if matches!(&resp, HelperResponse::Success { .. }) {
+                shutdown.store(true, Ordering::Relaxed);
+            }
             break;
         }
     }
@@ -243,7 +264,6 @@ fn dispatch(
     peer: &PeerCredential,
     rate_limiter: &Arc<Mutex<RateLimiter>>,
     last_operation: &Arc<Mutex<Option<(String, String)>>>,
-    shutdown: &Arc<AtomicBool>,
     version: &str,
     start_time: Instant,
 ) -> HelperResponse {
@@ -357,7 +377,10 @@ fn dispatch(
         }
 
         HelperRequest::Shutdown => {
-            shutdown.store(true, Ordering::Relaxed);
+            // Pure routing: handle_connection() publishes the flag only
+            // after the Success reply has been written, so the accept
+            // loop cannot tear the listener down while the reply is
+            // still in flight.
             HelperResponse::Success {
                 message: "shutdown initiated".to_string(),
                 exit_code: 0,
@@ -634,7 +657,6 @@ mod tests {
             &peer,
             &rate_limiter,
             &last_op,
-            &shutdown,
             "0.1.0",
             start,
         );
@@ -653,19 +675,136 @@ mod tests {
             &root_peer,
             &rate_limiter,
             &last_op,
-            &shutdown,
             "0.1.0",
             start,
         );
         assert!(matches!(resp, HelperResponse::Success { .. }));
-        assert!(shutdown.load(Ordering::Relaxed));
+        // The flag is no longer published here — handle_connection()
+        // publishes it only after the reply is written. The full
+        // protocol path is covered by shutdown_reply_precedes_daemon_exit.
+        assert!(!shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn request_shutdown_exits_the_accept_loop_without_a_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("system-helper.sock");
+        let server = Arc::new(DaemonServer::new(
+            socket_path.to_str().expect("socket path is UTF-8"),
+        ));
+        let runner = Arc::clone(&server);
+        let handle = thread::spawn(move || runner.run());
+
+        // Wait for the listener to bind.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !socket_path.exists() && Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(socket_path.exists(), "daemon never bound its socket");
+
+        server.request_shutdown();
+
+        // The accept loop must notice the flag on its own: no client should
+        // have to connect just to unblock a parked accept(2).
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            handle.is_finished(),
+            "daemon still running 5s after request_shutdown"
+        );
+    }
+
+    /// Regression for the Shutdown reply race: the client must receive its
+    /// `Success` before the daemon exits. `dispatch()` used to publish the
+    /// shutdown flag before the connection worker wrote the reply, so the
+    /// accept loop could observe the flag within one 50 ms poll and `run()`
+    /// could remove the socket while the reply was still in flight — the
+    /// root client then read EOF instead of the `Success` it was owed.
+    ///
+    /// Needs a real authorized (root) peer credential from `SO_PEERCRED`,
+    /// so it only runs when the test process itself is root.
+    #[test]
+    fn shutdown_reply_precedes_daemon_exit() {
+        if !nix::unistd::Uid::effective().is_root() {
+            eprintln!("skipping: needs a root peer credential");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("system-helper.sock");
+        let server = Arc::new(DaemonServer::new(
+            socket_path.to_str().expect("socket path is UTF-8"),
+        ));
+        let runner = Arc::clone(&server);
+        let handle = thread::spawn(move || runner.run());
+
+        // Wait for the listener to bind.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !socket_path.exists() && Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(socket_path.exists(), "daemon never bound its socket");
+
+        // The socket file appears between bind(2) and listen(2), so an
+        // eager connect can race the server setup and see ECONNREFUSED —
+        // retry until the deadline. This is harness bookkeeping only: the
+        // regression assertion below is about the Shutdown reply, long
+        // after the server is up.
+        let mut client = None;
+        let connect_deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while client.is_none() && Instant::now() < connect_deadline {
+            match UnixStream::connect(&socket_path) {
+                Ok(c) => client = Some(c),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("connect: {e}"),
+            }
+        }
+        let mut client = client.expect("daemon never accepted a connection");
+
+        // Handshake first, as the protocol requires.
+        send_message(
+            &mut client,
+            &HelperRequest::Handshake {
+                cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        )
+        .expect("send handshake");
+        let hs: HelperResponse = recv_message(&mut client).expect("handshake reply");
+        assert!(matches!(
+            hs,
+            HelperResponse::HandshakeOk {
+                compatible: true,
+                ..
+            }
+        ));
+
+        // Shutdown over the real protocol path.
+        send_message(&mut client, &HelperRequest::Shutdown).expect("send shutdown");
+        // The regression assertion: the reply must arrive — the daemon
+        // must not exit between constructing it and writing it.
+        let resp: HelperResponse = recv_message(&mut client).expect("Success reply, not EOF");
+        assert!(matches!(resp, HelperResponse::Success { ref message, .. }
+                if message == "shutdown initiated"));
+
+        // The daemon then exits on its own, with no extra connection.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            handle.is_finished(),
+            "daemon still running 5s after the Shutdown reply"
+        );
     }
 
     #[test]
     fn dispatch_system_status() {
         let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(30)));
         let last_op = Arc::new(Mutex::new(None));
-        let shutdown = Arc::new(AtomicBool::new(false));
         let start = Instant::now();
 
         let peer = PeerCredential {
@@ -678,7 +817,6 @@ mod tests {
             &peer,
             &rate_limiter,
             &last_op,
-            &shutdown,
             "0.1.0",
             start,
         );
