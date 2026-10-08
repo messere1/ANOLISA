@@ -9334,7 +9334,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn sched_child_runs_first_reads_truthiness_signed_and_counts_mariadbd() {
         // kernel.sched_child_runs_first was a plain proc_dointvec int with
