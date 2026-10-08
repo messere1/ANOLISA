@@ -3583,10 +3583,32 @@ fn fork_server_present(info: &SystemInfo) -> bool {
         || info.has_process("apache2")
         || info.has_process("postgres")
         || info.has_process("mysqld")
+        // MariaDB 10.4+ runs as mariadbd — the same OLTP server as mysqld,
+        // and the same fork-server shape for this gate.
+        || info.has_process("mariadbd")
 }
 
 fn eval_sched_child_runs_first(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/sched_child_runs_first";
+    eval_sched_child_runs_first_at(info, recs, "/proc/sys/kernel/sched_child_runs_first")
+}
+
+/// Path-injectable form of [`eval_sched_child_runs_first`] (the `eval_*_at`
+/// idiom) so the signed read is unit-testable against a temp file instead of
+/// the live /proc.
+///
+/// Through its removal the knob was registered as a plain `proc_dointvec`
+/// int with no min/max (kernel/sysctl.c), so -1 is a legal, persistent
+/// value, and task_fork_fair() consumed it as a truthiness test
+/// (`if (sysctl_sched_child_runs_first && curr && entity_before(curr, se))`,
+/// kernel/sched/fair.c) — the child runs first on any nonzero value. The
+/// unsigned reader parsed "-1" to Err and fell back to 0, the
+/// *already-optimal* value, so the rule went silent on exactly that host
+/// while the COW copies kept happening.
+fn eval_sched_child_runs_first_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -3594,7 +3616,7 @@ fn eval_sched_child_runs_first(info: &SystemInfo, recs: &mut Vec<Recommendation>
         return 1;
     }
     if let Some(rec) =
-        sched_child_runs_first_recommendation(read_sysctl_u64(path), &info.kernel_version)
+        sched_child_runs_first_recommendation(read_sysctl_i64(path), &info.kernel_version)
     {
         recs.push(rec);
     }
@@ -3603,8 +3625,12 @@ fn eval_sched_child_runs_first(info: &SystemInfo, recs: &mut Vec<Recommendation>
 
 /// Emit the `kernel.sched_child_runs_first` recommendation for an already-read
 /// value; split from the file probe so the version gate is testable anywhere.
+/// `current` is i64 because the knob was a plain `proc_dointvec` int with no
+/// min/max, and its only reader (task_fork_fair, kernel/sched/fair.c) was a
+/// truthiness test: -1 lets the child run first, exactly the state this rule
+/// asks a fork server to turn off.
 fn sched_child_runs_first_recommendation(
-    current: u64,
+    current: i64,
     kernel_version: &str,
 ) -> Option<Recommendation> {
     // Linux 6.6 merged EEVDF: commit e8f331bcc2 ("sched/smp: Use lag to
@@ -9306,6 +9332,63 @@ mod tests {
         {
             assert_eq!(rec.recommended_value, "0");
         }
+    }
+
+
+    #[test]
+    fn sched_child_runs_first_reads_truthiness_signed_and_counts_mariadbd() {
+        // kernel.sched_child_runs_first was a plain proc_dointvec int with
+        // no min/max (kernel/sysctl.c, through v6.5), and task_fork_fair()
+        // consumed it as a truthiness test (kernel/sched/fair.c: `if
+        // (sysctl_sched_child_runs_first && curr && entity_before(...))`),
+        // so -1 is a legal value that lets the child run first. The unsigned
+        // reader turned "-1" into the fallback 0 — the already-optimal value
+        // — and the rule went silent on exactly that host. MariaDB's daemon
+        // comm (10.4+) must also open the fork-server gate: it is the same
+        // OLTP server as mysqld, which the gate already counts.
+        let mut info = make_test_info();
+        info.processes = vec![ProcessInfo {
+            name: "mariadbd".to_string(),
+        }];
+        assert!(fork_server_present(&info), "mariadbd is a fork server");
+        for (value, expects_rec) in [(-1, true), (0, false), (1, true)] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_child_runs_first_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked = eval_sched_child_runs_first_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: any nonzero value lets the child run first"
+            );
+            if expects_rec {
+                assert_eq!(
+                    recs[0].current_value,
+                    value.to_string(),
+                    "the reported original is the value the kernel holds"
+                );
+                assert_eq!(recs[0].recommended_value, "0");
+            }
+        }
+        // The dead knob (6.6+, EEVDF removed the only reader) stays silent
+        // whatever the file says.
+        info.kernel_version = "6.8.0-40-generic".to_string();
+        let path = std::env::temp_dir().join(format!(
+            "ktuner_child_runs_first_dead_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "-1\n").unwrap();
+        let mut recs = Vec::new();
+        eval_sched_child_runs_first_at(&info, &mut recs, path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+        assert!(recs.is_empty(), "6.6+ never reads the knob");
     }
 
     #[test]
