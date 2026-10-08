@@ -48,7 +48,11 @@ pub struct SysctlValues {
     pub dirty_ratio: u64,
     pub dirty_background_ratio: u64,
     pub somaxconn: u64,
-    pub tcp_fastopen: u64,
+    /// Signed: the kernel registers `net.ipv4.tcp_fastopen` as a plain
+    /// unbounded `proc_dointvec` int (no extra1/extra2 in v5.10/v6.6
+    /// net/ipv4/sysctl_net_ipv4.c), so `-1` (every flag bit set) is a legal
+    /// on-disk value the unsigned reader would fold to 0.
+    pub tcp_fastopen: i64,
     pub thp_enabled: String,
 }
 
@@ -751,12 +755,19 @@ fn read_network_info_from(net_dir: &Path) -> Result<Vec<NetInfo>> {
 }
 
 fn read_sysctl_values() -> Result<SysctlValues> {
+    read_sysctl_values_at("/proc/sys")
+}
+
+/// Path-injectable core of [`read_sysctl_values`] (family convention): the
+/// tests feed a temp tree so the signed `-1` parse of the unbounded
+/// `tcp_fastopen` bitmask is assertable on any host.
+fn read_sysctl_values_at(root: &str) -> Result<SysctlValues> {
     Ok(SysctlValues {
-        swappiness: read_sysctl_u64("/proc/sys/vm/swappiness"),
-        dirty_ratio: read_sysctl_u64("/proc/sys/vm/dirty_ratio"),
-        dirty_background_ratio: read_sysctl_u64("/proc/sys/vm/dirty_background_ratio"),
-        somaxconn: read_sysctl_u64("/proc/sys/net/core/somaxconn"),
-        tcp_fastopen: read_sysctl_u64("/proc/sys/net/ipv4/tcp_fastopen"),
+        swappiness: read_sysctl_u64(&format!("{root}/vm/swappiness")),
+        dirty_ratio: read_sysctl_u64(&format!("{root}/vm/dirty_ratio")),
+        dirty_background_ratio: read_sysctl_u64(&format!("{root}/vm/dirty_background_ratio")),
+        somaxconn: read_sysctl_u64(&format!("{root}/net/core/somaxconn")),
+        tcp_fastopen: read_sysctl_i64(&format!("{root}/net/ipv4/tcp_fastopen")),
         thp_enabled: read_thp_enabled(),
     })
 }
@@ -1773,6 +1784,39 @@ mod tests {
         std::fs::write(&path, b"2\n").unwrap();
         assert_eq!(read_sysctl_i64(path.to_str().unwrap()), 2);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_sysctl_values_reads_tcp_fastopen_signed() {
+        // net.ipv4.tcp_fastopen is a plain unbounded proc_dointvec int in
+        // both v5.10 and v6.6 (net/ipv4/sysctl_net_ipv4.c, no
+        // extra1/extra2), so -1 is a legal value there and means every flag
+        // bit set. The unsigned reader that used to fill this field parsed
+        // "-1" to Err and fell back to 0, so a fully enabled host looked
+        // disabled to the rule. The unsigned fields keep their own readers.
+        let root = std::env::temp_dir().join(format!(
+            "ktuner_sysctl_values_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(root.join("vm")).expect("create vm dir");
+        fs::create_dir_all(root.join("net/core")).expect("create net/core dir");
+        fs::create_dir_all(root.join("net/ipv4")).expect("create net/ipv4 dir");
+        fs::write(root.join("vm/swappiness"), b"60\n").unwrap();
+        fs::write(root.join("vm/dirty_ratio"), b"20\n").unwrap();
+        fs::write(root.join("vm/dirty_background_ratio"), b"10\n").unwrap();
+        fs::write(root.join("net/core/somaxconn"), b"128\n").unwrap();
+        fs::write(root.join("net/ipv4/tcp_fastopen"), b"-1\n").unwrap();
+
+        let values =
+            read_sysctl_values_at(root.to_str().unwrap()).expect("read fake sysctl tree");
+        assert_eq!(values.tcp_fastopen, -1);
+        assert_eq!(values.swappiness, 60);
+        assert_eq!(values.dirty_ratio, 20);
+        assert_eq!(values.dirty_background_ratio, 10);
+        assert_eq!(values.somaxconn, 128);
+        fs::remove_dir_all(&root).ok();
     }
 
     /// The kernel's `dev_valid_name` accepts any interface name without `/`,

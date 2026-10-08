@@ -636,8 +636,16 @@ fn eval_tcp_fastopen(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
 /// promised. The value is written as a whole word, so flags the
 /// administrator set (0x4 `TFO_CLIENT_NO_COOKIE`, 0x200
 /// `TFO_SERVER_COOKIE_NOT_REQD`, ...) are kept rather than cleared.
-fn tcp_fastopen_recommendation(current: u64) -> Option<Recommendation> {
-    const REQUIRED: u64 = 0x1 | 0x2 | 0x400;
+///
+/// The registration is a plain unbounded `proc_dointvec` int in both v5.10
+/// and v6.6 (net/ipv4/sysctl_net_ipv4.c), so the value is signed: `-1` is a
+/// writable whole-word value with every flag bit set (client, server and
+/// all-listeners included), which the unsigned reader used to fold to 0 and
+/// then recommend enabling TFO on a host the kernel already treats as
+/// fully enabled. `current_value`/`recommended_value` therefore report the
+/// signed word the kernel holds.
+fn tcp_fastopen_recommendation(current: i64) -> Option<Recommendation> {
+    const REQUIRED: i64 = 0x1 | 0x2 | 0x400;
     if current & REQUIRED == REQUIRED {
         return None;
     }
@@ -6856,6 +6864,28 @@ mod tests {
         assert!(tcp_fastopen_recommendation(0x1 | 0x2 | 0x400).is_none());
         // Extra flags on top of the required set stay complete.
         assert!(tcp_fastopen_recommendation(0x1 | 0x2 | 0x4 | 0x200 | 0x400).is_none());
+    }
+
+    #[test]
+    fn tcp_fastopen_minus_one_is_fully_enabled() {
+        // The kernel registers net.ipv4.tcp_fastopen as a plain unbounded
+        // proc_dointvec int (v5.10/v6.6 net/ipv4/sysctl_net_ipv4.c, no
+        // extra1/extra2), so -1 is a writable whole-word value: every flag
+        // bit set, client + server + all-listeners included. The unsigned
+        // reader parsed "-1" to Err and fell back to 0, so the rule used to
+        // recommend enabling TFO on a host the kernel already treats as
+        // fully enabled.
+        assert!(tcp_fastopen_recommendation(-1).is_none());
+    }
+
+    #[test]
+    fn tcp_fastopen_keeps_administrator_flags_on_negative_values() {
+        // -2 = every flag except the client bit 0x1. The recommendation must
+        // report the value the kernel actually holds and set only the
+        // missing bits, without clearing anything the administrator chose.
+        let rec = tcp_fastopen_recommendation(-2).expect("the client bit is clear");
+        assert_eq!(rec.current_value, "-2");
+        assert_eq!(rec.recommended_value, "-1");
     }
 
     #[test]
