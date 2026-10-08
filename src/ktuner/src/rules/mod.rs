@@ -3188,7 +3188,11 @@ fn eval_icmp_echo_ignore_broadcasts(_info: &SystemInfo, recs: &mut Vec<Recommend
 }
 
 fn eval_accept_source_route(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    eval_accept_source_route_at(info, recs, "/proc/sys/net/ipv4/conf/all/accept_source_route")
+    eval_accept_source_route_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/conf/all/accept_source_route",
+    )
 }
 
 /// Path-injectable form of [`eval_accept_source_route`] (the `eval_*_at`
@@ -11926,7 +11930,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn accept_redirects_rules_read_truthiness_signed() {
         // conf/*/accept_redirects is the same devinet_conf_proc plain
@@ -12105,11 +12108,7 @@ mod tests {
         let forwarding = dir.join("eth0/forwarding");
         for (value, expected) in [("-1", true), ("0", false), ("1", true)] {
             std::fs::write(&forwarding, format!("{value}\n")).unwrap();
-            assert_eq!(
-                any_interface_forwards(&dir),
-                expected,
-                "forwarding={value}"
-            );
+            assert_eq!(any_interface_forwards(&dir), expected, "forwarding={value}");
         }
         std::fs::remove_dir_all(&dir).ok();
     }
