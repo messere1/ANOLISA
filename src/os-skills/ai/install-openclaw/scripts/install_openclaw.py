@@ -570,6 +570,19 @@ def run_command(cmd, *, env=None, dry_run=False, check=True, timeout=None, captu
     )
 
 
+def openclaw_env(args, *, base=None):
+    """Environment for OpenClaw CLI children.
+
+    OpenClaw locates its configuration through OPENCLAW_CONFIG_PATH; without
+    it every child would fall back to the default path (or an unrelated
+    inherited override), so a --config selection would only reach the file
+    written by apply_config and never the commands the installer launches.
+    """
+    env = (base or os.environ).copy()
+    env["OPENCLAW_CONFIG_PATH"] = str(Path(args.config).expanduser())
+    return env
+
+
 def find_command(name):
     search_dirs = os.environ.get("PATH", "").split(os.pathsep)
     search_dirs.extend(["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
@@ -962,6 +975,7 @@ def wait_gateway_ready(args):
     try:
         result = run_command(
             ["openclaw", "gateway", "status", "--deep"],
+            env=openclaw_env(args),
             check=False,
             timeout=args.gateway_status_timeout,
             capture_output=True,
@@ -1115,6 +1129,7 @@ def run_gateway_write_smoke(args, timeout):
     try:
         return run_command(
             cmd,
+            env=openclaw_env(args),
             check=False,
             timeout=timeout,
             capture_output=True,
@@ -1224,7 +1239,7 @@ def install_tokenless_plugin(args):
         return
 
     print(f"  tokenless adapter: {adapter_dir}")
-    env = os.environ.copy()
+    env = openclaw_env(args)
     env["ANOLISA_ADAPTER_DIR"] = str(adapter_dir)
     env["ANOLISA_COMPONENT"] = "tokenless"
     env["ANOLISA_TARGET"] = "openclaw"
@@ -1241,7 +1256,7 @@ def install_tokenless_plugin(args):
 
 
 def install_dingtalk_plugin(args):
-    env = os.environ.copy()
+    env = openclaw_env(args)
     if args.npm_registry:
         env["NPM_CONFIG_REGISTRY"] = args.npm_registry
     run_command(
@@ -1255,12 +1270,14 @@ def start_gateway(args):
     if args.doctor_fix:
         run_command(
             ["openclaw", "doctor", "--fix"],
+            env=openclaw_env(args),
             dry_run=args.dry_run,
             check=False,
             timeout=args.gateway_command_timeout,
         )
     run_command(
         ["openclaw", "gateway", "stop"],
+        env=openclaw_env(args),
         dry_run=args.dry_run,
         check=False,
         timeout=args.gateway_command_timeout,
@@ -1268,12 +1285,14 @@ def start_gateway(args):
     clear_openclaw_gateway_port(args)
     run_command(
         ["openclaw", "gateway", "install", "--port", str(args.gateway_port)],
+        env=openclaw_env(args),
         dry_run=args.dry_run,
         check=False,
         timeout=args.gateway_command_timeout,
     )
     run_command(
         ["openclaw", "gateway", "restart"],
+        env=openclaw_env(args),
         dry_run=args.dry_run,
         check=False,
         timeout=args.gateway_command_timeout,
