@@ -1809,8 +1809,7 @@ mod tests {
         fs::write(root.join("net/core/somaxconn"), b"128\n").unwrap();
         fs::write(root.join("net/ipv4/tcp_fastopen"), b"-1\n").unwrap();
 
-        let values =
-            read_sysctl_values_at(root.to_str().unwrap()).expect("read fake sysctl tree");
+        let values = read_sysctl_values_at(root.to_str().unwrap()).expect("read fake sysctl tree");
         assert_eq!(values.tcp_fastopen, -1);
         assert_eq!(values.swappiness, 60);
         assert_eq!(values.dirty_ratio, 20);
