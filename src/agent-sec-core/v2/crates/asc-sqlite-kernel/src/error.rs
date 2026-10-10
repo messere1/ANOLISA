@@ -77,6 +77,18 @@ pub enum KernelError {
     #[error("sqlite store is disabled")]
     Disabled,
 
+    /// The database path holds something other than a regular file.
+    ///
+    /// The read-only identity check inspects the path without following a
+    /// symlink; a symlink, FIFO, directory or device node standing in for the
+    /// database is a replacement the store must refuse to open rather than
+    /// serve, mirroring the policy lease's `UnsafePath` rejection.
+    #[error("unsafe database path {}: not a regular file", path.display())]
+    UnsafePath {
+        /// The rejected path.
+        path: PathBuf,
+    },
+
     /// The record was rejected before `SQLite` was touched.
     ///
     /// Stands in for v1's `ValueError` / `TypeError`, which signal a caller bug
@@ -116,6 +128,7 @@ impl KernelError {
             Self::InvalidColumnName(_) | Self::Malformed(_) => "ValueError",
             Self::EmptySchema => "EmptySchemaError",
             Self::Disabled => "StoreDisabled",
+            Self::UnsafePath { .. } => "UnsafePathError",
         }
     }
 }

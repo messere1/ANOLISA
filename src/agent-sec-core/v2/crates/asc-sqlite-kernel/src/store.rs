@@ -12,7 +12,7 @@
 //! to move into `spawn_blocking` when the daemon is wired up.
 
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -33,7 +33,10 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 struct Inner {
     connection: Option<Connection>,
     /// `(st_dev, st_ino)` of the file behind the cached read-only connection.
-    db_identity: Option<(u64, u64)>,
+    ///
+    /// `st_dev` keeps rustix's native device type so the identity survives
+    /// platforms where `dev_t` is narrower than `u64`.
+    db_identity: Option<(rustix::fs::Dev, u64)>,
     disabled: bool,
     force_schema_convergence: bool,
 }
@@ -188,7 +191,10 @@ impl SqliteStore {
     /// Ensures `inner.connection` holds a usable connection.
     ///
     /// Reproduces v1 `session_factory`'s branching, including the read-only
-    /// identity check and the single corruption rebuild attempt.
+    /// identity check, with one hardening v1 lacked: the identity is taken
+    /// with `lstat`, so a path that is no longer a regular file — a symlink
+    /// swap, a FIFO, a device node — is refused instead of followed or
+    /// opened.
     fn prepare_connection(
         &self,
         inner: &mut Inner,
@@ -198,15 +204,31 @@ impl SqliteStore {
         if self.read_only {
             // A replaced file (new inode) must not be served from a stale
             // handle, so the identity is compared on every access.
-            let Some(current) = self.current_db_identity() else {
-                dispose_inner(inner);
-                return Ok(None);
-            };
-            identity = Some(current);
-            if inner.connection.is_some() && inner.db_identity == identity {
-                return Ok(Some(()));
+            match self.current_path_identity() {
+                PathIdentity::File(dev, ino) => {
+                    identity = Some((dev, ino));
+                    if inner.connection.is_some() && inner.db_identity == identity {
+                        return Ok(Some(()));
+                    }
+                    dispose_inner(inner);
+                }
+                PathIdentity::Absent => {
+                    dispose_inner(inner);
+                    return Ok(None);
+                }
+                PathIdentity::Unsafe => {
+                    dispose_inner(inner);
+                    let error = KernelError::UnsafePath {
+                        path: self.path.clone(),
+                    };
+                    if raise_on_error {
+                        return Err(error);
+                    }
+                    tracing::warn!(target: "asc_process_diagnostic",
+                        "{} refusing unsafe database path: {error}", self.log_prefix);
+                    return Ok(None);
+                }
             }
-            dispose_inner(inner);
         } else if inner.connection.is_some() {
             return Ok(Some(()));
         }
@@ -361,9 +383,42 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn current_db_identity(&self) -> Option<(u64, u64)> {
-        let metadata = fs::metadata(&self.path).ok()?;
-        Some((metadata.dev(), metadata.ino()))
+    /// Inspects what the database path currently holds, without following it.
+    ///
+    /// The check is a path syscall (`lstat`): it opens no descriptor, so it
+    /// cannot release the POSIX locks another connection in this process
+    /// holds on the database, and it reports a symlink, FIFO, directory or
+    /// device node standing in for the database instead of following it to
+    /// whatever it points at — the same discipline the policy database lease
+    /// applies to its visible path.
+    fn current_path_identity(&self) -> PathIdentity {
+        path_identity(&self.path)
+    }
+}
+
+/// What a database path holds, as the read-only identity check sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathIdentity {
+    /// No entry at the path: the normal state before the first write.
+    Absent,
+    /// A regular file with this `(st_dev, st_ino)` identity, in rustix's
+    /// native device type.
+    File(rustix::fs::Dev, u64),
+    /// Something other than a regular file — a symlink, FIFO, directory or
+    /// device node — that the store must not open.
+    Unsafe,
+}
+
+/// Resolves the identity of `path` without following it.
+fn path_identity(path: &Path) -> PathIdentity {
+    // Any stat failure (a missing entry, a missing parent) is the absent
+    // state, exactly as the following `stat` v1 used treated it.
+    let Ok(stat) = rustix::fs::lstat(path) else {
+        return PathIdentity::Absent;
+    };
+    match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+        rustix::fs::FileType::RegularFile => PathIdentity::File(stat.st_dev, stat.st_ino),
+        _ => PathIdentity::Unsafe,
     }
 }
 
@@ -376,6 +431,7 @@ fn dispose_inner(inner: &mut Inner) {
 mod tests {
     use super::*;
     use crate::schema::{ColumnSpec, IndexSpec};
+    use std::os::unix::fs::{MetadataExt, symlink};
     use tempfile::TempDir;
 
     const WIDGETS: &[TableSpec] = &[TableSpec {
@@ -508,6 +564,112 @@ mod tests {
             .expect("read")
             .expect("value");
         assert_eq!(second, "second", "a replaced inode must be reopened");
+    }
+
+    fn seed_with_label(path: &Path, label: &str) {
+        store_at(path, false)
+            .with_connection(true, |conn| {
+                conn.execute("INSERT INTO widgets (id, label) VALUES ('a', ?1)", [label])?;
+                Ok(())
+            })
+            .expect("write")
+            .expect("value");
+    }
+
+    fn read_label(store: &SqliteStore, raise_on_error: bool) -> Option<String> {
+        store
+            .with_connection(raise_on_error, |conn| {
+                Ok(conn.query_row("SELECT label FROM widgets", [], |row| {
+                    row.get::<_, String>(0)
+                })?)
+            })
+            .expect("read must not hard-error")
+    }
+
+    #[test]
+    fn a_symlinked_database_path_is_rejected_not_followed() {
+        // The read-only identity check exists so a replaced path is never
+        // served from a stale handle; a swap that leaves a *symlink* behind
+        // is a replacement too, and must be refused rather than followed —
+        // the same discipline the policy database lease applies
+        // (`RepositoryError::UnsafePath`).
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        seed_with_label(&path, "own");
+
+        let reader = store_at(&path, true);
+        assert_eq!(read_label(&reader, false).as_deref(), Some("own"));
+
+        let target = dir.path().join("elsewhere.db");
+        seed_with_label(&target, "foreign");
+        fs::remove_file(&path).expect("move the original aside");
+        symlink(&target, &path).expect("replace the path with a symlink");
+
+        assert_eq!(
+            read_label(&reader, false),
+            None,
+            "a degrading reader must not serve the symlink target"
+        );
+        let raised = reader.with_connection(true, |_| Ok(()));
+        assert!(
+            matches!(raised, Err(KernelError::UnsafePath { .. })),
+            "a raising reader must refuse the unsafe path, got {raised:?}"
+        );
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_unsafe_not_absent() {
+        // `lstat` sees the dangling link itself, so it is reported as an
+        // unsafe path rather than the pre-first-write "absent" state.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        symlink(dir.path().join("nowhere.db"), &path).expect("dangling symlink");
+
+        let reader = store_at(&path, true);
+        assert_eq!(
+            read_label(&reader, false),
+            None,
+            "the degrading shape stays fail-closed"
+        );
+        let raised = reader.with_connection(true, |_| Ok(()));
+        assert!(
+            matches!(raised, Err(KernelError::UnsafePath { .. })),
+            "a dangling link must not read as a missing database, got {raised:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_regular_database_path_fails_closed_instead_of_hanging() {
+        // A FIFO passes a following stat, and `SQLite`'s open(2) on a FIFO
+        // with no writer blocks forever — under the store mutex. The
+        // identity check must reject it before the open. The read runs on a
+        // bounded thread so a regression fails this test instead of hanging
+        // the suite.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Mode::from_bits(0o600).expect("mode"),
+        )
+        .expect("fifo");
+
+        let reader = std::sync::Arc::new(store_at(&path, true));
+        let worker = std::sync::Arc::clone(&reader);
+        let (done, arrived) = std::sync::mpsc::channel();
+        let opened = std::thread::spawn(move || {
+            let outcome = worker.with_connection(true, |_| Ok(()));
+            let _ = done.send(outcome);
+        });
+        let Ok(outcome) = arrived.recv_timeout(std::time::Duration::from_secs(10)) else {
+            panic!("opening a FIFO must fail closed, not hang the store");
+        };
+        assert!(
+            matches!(outcome, Err(KernelError::UnsafePath { .. })),
+            "a FIFO must not be treated as a database, got {outcome:?}"
+        );
+        let joined = opened.join();
+        assert!(joined.is_ok(), "the worker thread must finish");
     }
 
     #[test]
